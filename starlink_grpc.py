@@ -77,10 +77,17 @@ terminal has determined to be obstructed.
     of area (time?) within that wedge that the user terminal has determined to
     be obstructed between it and the satellites with which it communicates.
     The values are expressed as a fraction of total, not a fraction of the
-    wedge, so max value for each element should be 1/12. The first element in
-    the sequence represents the wedge that spans exactly North to 30 degrees
-    East of North, and subsequent wedges rotate 30 degrees further in the same
-    direction. (It's not clear if this will hold true at all latitudes.)
+    wedge, so max value for each element should be something like 1/12, but
+    may vary from wedge to wedge if they are weighted differently. The first
+    element in the sequence represents the wedge that spans exactly North to
+    30 degrees East of North, and subsequent wedges rotate 30 degrees further
+    in the same direction. (It's not clear if this will hold true at all
+    latitudes.)
+: **raw_wedges_fraction_obstructed** : A 12 element sequence. Wedges
+    presumably correlate with the ones in *wedges_fraction_obstructed*, but
+    the exact relationship is unknown. The numbers in this one are generally
+    higher and may represent fraction of the wedge, in which case max value
+    for each element should be 1.
 : **valid_s** : It is unclear what this field means exactly, but it appears to
     be a measure of how complete the data is that the user terminal uses to
     determine obstruction locations.
@@ -300,9 +307,29 @@ import statistics
 
 import grpc
 
-from spacex.api.device import device_pb2
-from spacex.api.device import device_pb2_grpc
-from spacex.api.device import dish_pb2
+try:
+    from spacex.api.device import device_pb2
+    from spacex.api.device import device_pb2_grpc
+    from spacex.api.device import dish_pb2
+    import_ok = True
+except ImportError:
+    from yagrc import importer
+    import_ok = False
+
+
+def import_protocols(channel):
+    grpc_importer = importer.GrpcImporter()
+    grpc_importer.configure(
+        channel, filenames=["spacex/api/device/device.proto", "spacex/api/device/dish.proto"])
+
+    global device_pb2
+    global device_pb2_grpc
+    global dish_pb2
+    from spacex.api.device import device_pb2
+    from spacex.api.device import device_pb2_grpc
+    from spacex.api.device import dish_pb2
+    global import_ok
+    import_ok = True
 
 
 class GrpcError(Exception):
@@ -352,6 +379,9 @@ def status_field_names():
         A tuple with 3 lists, with status data field names, alert detail field
         names, and obstruction detail field names, in that order.
     """
+    if not import_ok:
+        with grpc.insecure_channel("192.168.100.1:9200") as channel:
+            import_protocols(channel)
     alert_names = []
     for field in dish_pb2.DishAlerts.DESCRIPTOR.fields:
         alert_names.append("alert_" + field.name)
@@ -374,6 +404,7 @@ def status_field_names():
         "seconds_obstructed",
     ], [
         "wedges_fraction_obstructed[12]",
+        "raw_wedges_fraction_obstructed[12]",
         "valid_s",
     ], alert_names
 
@@ -388,6 +419,9 @@ def status_field_types():
         A tuple with 3 lists, with status data field types, alert detail field
         types, and obstruction detail field types, in that order.
     """
+    if not import_ok:
+        with grpc.insecure_channel("192.168.100.1:9200") as channel:
+            import_protocols(channel)
     return [
         str,  # id
         str,  # hardware_version
@@ -406,6 +440,7 @@ def status_field_types():
         float,  # seconds_obstructed
     ], [
         float,  # wedges_fraction_obstructed[]
+        float,  # raw_wedges_fraction_obstructed[]
         float,  # valid_s
     ], [bool] * len(dish_pb2.DishAlerts.DESCRIPTOR.fields)
 
@@ -424,6 +459,8 @@ def get_status(context=None):
     """
     if context is None:
         with grpc.insecure_channel("192.168.100.1:9200") as channel:
+            if not import_ok:
+                import_protocols(channel)
             stub = device_pb2_grpc.DeviceStub(channel)
             response = stub.Handle(device_pb2.Request(get_status={}))
         return response.dish_get_status
@@ -431,6 +468,8 @@ def get_status(context=None):
     while True:
         channel, reused = context.get_channel()
         try:
+            if not import_ok:
+                import_protocols(channel)
             stub = device_pb2_grpc.DeviceStub(channel)
             response = stub.Handle(device_pb2.Request(get_status={}))
             return response.dish_get_status
@@ -510,6 +549,7 @@ def status_data(context=None):
         "seconds_obstructed": status.obstruction_stats.last_24h_obstructed_s,
     }, {
         "wedges_fraction_obstructed[]": status.obstruction_stats.wedge_abs_fraction_obstructed,
+        "raw_wedges_fraction_obstructed[]": status.obstruction_stats.wedge_fraction_obstructed,
         "valid_s": status.obstruction_stats.valid_s,
     }, alerts
 
@@ -681,6 +721,8 @@ def get_history(context=None):
     """
     if context is None:
         with grpc.insecure_channel("192.168.100.1:9200") as channel:
+            if not import_ok:
+                import_protocols(channel)
             stub = device_pb2_grpc.DeviceStub(channel)
             response = stub.Handle(device_pb2.Request(get_history={}))
         return response.dish_get_history
@@ -688,6 +730,8 @@ def get_history(context=None):
     while True:
         channel, reused = context.get_channel()
         try:
+            if not import_ok:
+                import_protocols(channel)
             stub = device_pb2_grpc.DeviceStub(channel)
             response = stub.Handle(device_pb2.Request(get_history={}))
             return response.dish_get_history
@@ -720,6 +764,9 @@ def _compute_sample_range(history, parse_samples, start=None, verbose=False):
 
     if start is None or start < current - parse_samples:
         start = current - parse_samples
+
+    if start == current:
+        return range(0), 0, current
 
     # This is ring buffer offset, so both index to oldest data sample and
     # index to next data sample after the newest one.
@@ -818,7 +865,7 @@ def history_ping_stats(parse_samples, verbose=False, context=None):
     return history_stats(parse_samples, verbose=verbose, context=context)[0:3]
 
 
-def history_stats(parse_samples, verbose=False, context=None):
+def history_stats(parse_samples, start=None, verbose=False, context=None):
     """Fetch, parse, and compute the packet loss stats.
 
     Note:
@@ -853,6 +900,7 @@ def history_stats(parse_samples, verbose=False, context=None):
 
     sample_range, parse_samples, current = _compute_sample_range(history,
                                                                  parse_samples,
+                                                                 start=start,
                                                                  verbose=verbose)
 
     tot = 0.0
@@ -973,10 +1021,12 @@ def history_stats(parse_samples, verbose=False, context=None):
 
     rtt_all.sort(key=lambda x: x[0])
     wmean_all, wdeciles_all = weighted_mean_and_quantiles(rtt_all, 10)
-    if rtt_full:
+    if len(rtt_full) > 1:
         deciles_full = [min(rtt_full)]
         deciles_full.extend(statistics.quantiles(rtt_full, n=10, method="inclusive"))
         deciles_full.append(max(rtt_full))
+    elif rtt_full:
+        deciles_full = [rtt_full[0]] * 11
     else:
         deciles_full = [None] * 11
 
