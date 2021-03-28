@@ -107,12 +107,16 @@ their nature, but the field names are pretty self-explanatory.
 
 : **alert_motors_stuck** : Alert corresponding with bit 0 (bit mask 1) in
     *alerts*.
-: **alert_thermal_throttle** : Alert corresponding with bit 1 (bit mask 2) in
+: **alert_thermal_shutdown** : Alert corresponding with bit 1 (bit mask 2) in
     *alerts*.
-: **alert_thermal_shutdown** : Alert corresponding with bit 2 (bit mask 4) in
+: **alert_thermal_throttle** : Alert corresponding with bit 2 (bit mask 4) in
     *alerts*.
 : **alert_unexpected_location** : Alert corresponding with bit 3 (bit mask 8)
     in *alerts*.
+: **alert_mast_not_near_vertical** : Alert corresponding with bit 4 (bit mask
+    16) in *alerts*.
+: **slow_ethernet_speeds** : Alert corresponding with bit 5 (bit mask 32) in
+    *alerts*.
 
 General history data
 --------------------
@@ -308,28 +312,21 @@ import statistics
 import grpc
 
 try:
-    from spacex.api.device import device_pb2
-    from spacex.api.device import device_pb2_grpc
-    from spacex.api.device import dish_pb2
-    import_ok = True
-except ImportError:
     from yagrc import importer
-    import_ok = False
+    importer.add_lazy_packages(["spacex.api.device"])
+    imports_pending = True
+except (ImportError, AttributeError):
+    imports_pending = False
+
+from spacex.api.device import device_pb2
+from spacex.api.device import device_pb2_grpc
+from spacex.api.device import dish_pb2
 
 
-def import_protocols(channel):
-    grpc_importer = importer.GrpcImporter()
-    grpc_importer.configure(
-        channel, filenames=["spacex/api/device/device.proto", "spacex/api/device/dish.proto"])
-
-    global device_pb2
-    global device_pb2_grpc
-    global dish_pb2
-    from spacex.api.device import device_pb2
-    from spacex.api.device import device_pb2_grpc
-    from spacex.api.device import dish_pb2
-    global import_ok
-    import_ok = True
+def resolve_imports(channel):
+    importer.resolve_lazy_imports(channel)
+    global imports_pending
+    imports_pending = False
 
 
 class GrpcError(Exception):
@@ -352,9 +349,9 @@ class ChannelContext:
     `close()` should be called on the object when it is no longer
     in use.
     """
-    def __init__(self, target="192.168.100.1:9200"):
+    def __init__(self, target=None):
         self.channel = None
-        self.target = target
+        self.target = "192.168.100.1:9200" if target is None else target
 
     def get_channel(self):
         reused = True
@@ -369,19 +366,53 @@ class ChannelContext:
         self.channel = None
 
 
-def status_field_names():
+def call_with_channel(function, *args, context=None, **kwargs):
+    """Call a function with a channel object.
+
+    Args:
+        function: Function to call with channel as first arg.
+        args: Additional args to pass to function
+        context (ChannelContext): Optionally provide a channel for (re)use.
+            If not set, a new default channel will be used and then closed.
+        kwargs: Additional keyword args to pass to function.
+    """
+    if context is None:
+        with grpc.insecure_channel("192.168.100.1:9200") as channel:
+            return function(channel, *args, **kwargs)
+
+    while True:
+        channel, reused = context.get_channel()
+        try:
+            return function(channel, *args, **kwargs)
+        except grpc.RpcError:
+            context.close()
+            if not reused:
+                raise
+
+
+def status_field_names(context=None):
     """Return the field names of the status data.
 
     Note:
         See module level docs regarding brackets in field names.
 
+    Args:
+        context (ChannelContext): Optionally provide a channel for (re)use
+            with reflection service.
+
     Returns:
         A tuple with 3 lists, with status data field names, alert detail field
         names, and obstruction detail field names, in that order.
+
+    Raises:
+        GrpcError: No user terminal is currently available to resolve imports
+            via reflection.
     """
-    if not import_ok:
-        with grpc.insecure_channel("192.168.100.1:9200") as channel:
-            import_protocols(channel)
+    if imports_pending:
+        try:
+            call_with_channel(resolve_imports, context=context)
+        except grpc.RpcError as e:
+            raise GrpcError(e)
     alert_names = []
     for field in dish_pb2.DishAlerts.DESCRIPTOR.fields:
         alert_names.append("alert_" + field.name)
@@ -409,19 +440,29 @@ def status_field_names():
     ], alert_names
 
 
-def status_field_types():
+def status_field_types(context=None):
     """Return the field types of the status data.
 
     Return the type classes for each field. For sequence types, the type of
     element in the sequence is returned, not the type of the sequence.
 
+    Args:
+        context (ChannelContext): Optionally provide a channel for (re)use
+            with reflection service.
+
     Returns:
         A tuple with 3 lists, with status data field types, alert detail field
         types, and obstruction detail field types, in that order.
+
+    Raises:
+        GrpcError: No user terminal is currently available to resolve imports
+            via reflection.
     """
-    if not import_ok:
-        with grpc.insecure_channel("192.168.100.1:9200") as channel:
-            import_protocols(channel)
+    if imports_pending:
+        try:
+            call_with_channel(resolve_imports, context=context)
+        except grpc.RpcError as e:
+            raise GrpcError(e)
     return [
         str,  # id
         str,  # hardware_version
@@ -457,26 +498,14 @@ def get_status(context=None):
     Raises:
         grpc.RpcError: Communication or service error.
     """
-    if context is None:
-        with grpc.insecure_channel("192.168.100.1:9200") as channel:
-            if not import_ok:
-                import_protocols(channel)
-            stub = device_pb2_grpc.DeviceStub(channel)
-            response = stub.Handle(device_pb2.Request(get_status={}))
+    def grpc_call(channel):
+        if imports_pending:
+            resolve_imports(channel)
+        stub = device_pb2_grpc.DeviceStub(channel)
+        response = stub.Handle(device_pb2.Request(get_status={}))
         return response.dish_get_status
 
-    while True:
-        channel, reused = context.get_channel()
-        try:
-            if not import_ok:
-                import_protocols(channel)
-            stub = device_pb2_grpc.DeviceStub(channel)
-            response = stub.Handle(device_pb2.Request(get_status={}))
-            return response.dish_get_status
-        except grpc.RpcError:
-            context.close()
-            if not reused:
-                raise
+    return call_with_channel(grpc_call, context=context)
 
 
 def get_id(context=None):
@@ -513,8 +542,7 @@ def status_data(context=None):
         values, in that order.
 
     Raises:
-        GrpcError: Failed getting history info from the Starlink user
-            terminal.
+        GrpcError: Failed getting status info from the Starlink user terminal.
     """
     try:
         status = get_status(context)
@@ -529,7 +557,8 @@ def status_data(context=None):
     for field in status.alerts.DESCRIPTOR.fields:
         value = getattr(status.alerts, field.name)
         alerts["alert_" + field.name] = value
-        alert_bits |= (1 if value else 0) << (field.index)
+        if field.number < 65:
+            alert_bits |= (1 if value else 0) << (field.number - 1)
 
     return {
         "id": status.device_info.id,
@@ -719,26 +748,14 @@ def get_history(context=None):
     Raises:
         grpc.RpcError: Communication or service error.
     """
-    if context is None:
-        with grpc.insecure_channel("192.168.100.1:9200") as channel:
-            if not import_ok:
-                import_protocols(channel)
-            stub = device_pb2_grpc.DeviceStub(channel)
-            response = stub.Handle(device_pb2.Request(get_history={}))
+    def grpc_call(channel):
+        if imports_pending:
+            resolve_imports(channel)
+        stub = device_pb2_grpc.DeviceStub(channel)
+        response = stub.Handle(device_pb2.Request(get_history={}))
         return response.dish_get_history
 
-    while True:
-        channel, reused = context.get_channel()
-        try:
-            if not import_ok:
-                import_protocols(channel)
-            stub = device_pb2_grpc.DeviceStub(channel)
-            response = stub.Handle(device_pb2.Request(get_history={}))
-            return response.dish_get_history
-        except grpc.RpcError:
-            context.close()
-            if not reused:
-                raise
+    return call_with_channel(grpc_call, context=context)
 
 
 def _compute_sample_range(history, parse_samples, start=None, verbose=False):
@@ -783,7 +800,7 @@ def _compute_sample_range(history, parse_samples, start=None, verbose=False):
     return sample_range, current - start, current
 
 
-def history_bulk_data(parse_samples, start=None, verbose=False, context=None):
+def history_bulk_data(parse_samples, start=None, verbose=False, context=None, history=None):
     """Fetch history data for a range of samples.
 
     Args:
@@ -804,6 +821,8 @@ def history_bulk_data(parse_samples, start=None, verbose=False, context=None):
         verbose (bool): Optionally produce verbose output.
         context (ChannelContext): Optionally provide a channel for reuse
             across repeated calls.
+        history: Optionally provide the history data to use instead of fetching
+            it, from a prior call to `get_history`.
 
     Returns:
         A tuple with 2 dicts, the first mapping general data names to their
@@ -818,10 +837,11 @@ def history_bulk_data(parse_samples, start=None, verbose=False, context=None):
         GrpcError: Failed getting history info from the Starlink user
             terminal.
     """
-    try:
-        history = get_history(context)
-    except grpc.RpcError as e:
-        raise GrpcError(e)
+    if history is None:
+        try:
+            history = get_history(context)
+        except grpc.RpcError as e:
+            raise GrpcError(e)
 
     sample_range, parsed_samples, current = _compute_sample_range(history,
                                                                   parse_samples,
@@ -865,8 +885,8 @@ def history_ping_stats(parse_samples, verbose=False, context=None):
     return history_stats(parse_samples, verbose=verbose, context=context)[0:3]
 
 
-def history_stats(parse_samples, start=None, verbose=False, context=None):
-    """Fetch, parse, and compute the packet loss stats.
+def history_stats(parse_samples, start=None, verbose=False, context=None, history=None):
+    """Fetch, parse, and compute ping and usage stats.
 
     Note:
         See module level docs regarding brackets in field names.
@@ -877,6 +897,8 @@ def history_stats(parse_samples, start=None, verbose=False, context=None):
         verbose (bool): Optionally produce verbose output.
         context (ChannelContext): Optionally provide a channel for reuse
             across repeated calls.
+        history: Optionally provide the history data to use instead of fetching
+            it, from a prior call to `get_history`.
 
     Returns:
         A tuple with 6 dicts, mapping general data names, ping drop stat
@@ -893,15 +915,16 @@ def history_stats(parse_samples, start=None, verbose=False, context=None):
         GrpcError: Failed getting history info from the Starlink user
             terminal.
     """
-    try:
-        history = get_history(context)
-    except grpc.RpcError as e:
-        raise GrpcError(e)
+    if history is None:
+        try:
+            history = get_history(context)
+        except grpc.RpcError as e:
+            raise GrpcError(e)
 
-    sample_range, parse_samples, current = _compute_sample_range(history,
-                                                                 parse_samples,
-                                                                 start=start,
-                                                                 verbose=verbose)
+    sample_range, parsed_samples, current = _compute_sample_range(history,
+                                                                  parse_samples,
+                                                                  start=start,
+                                                                  verbose=verbose)
 
     tot = 0.0
     count_full_drop = 0
@@ -1021,17 +1044,11 @@ def history_stats(parse_samples, start=None, verbose=False, context=None):
 
     rtt_all.sort(key=lambda x: x[0])
     wmean_all, wdeciles_all = weighted_mean_and_quantiles(rtt_all, 10)
-    if len(rtt_full) > 1:
-        deciles_full = [min(rtt_full)]
-        deciles_full.extend(statistics.quantiles(rtt_full, n=10, method="inclusive"))
-        deciles_full.append(max(rtt_full))
-    elif rtt_full:
-        deciles_full = [rtt_full[0]] * 11
-    else:
-        deciles_full = [None] * 11
+    rtt_full.sort()
+    mean_full, deciles_full = weighted_mean_and_quantiles(tuple((x, 1.0) for x in rtt_full), 10)
 
     return {
-        "samples": parse_samples,
+        "samples": parsed_samples,
         "end_counter": current,
     }, {
         "total_ping_drop": tot,
@@ -1050,7 +1067,7 @@ def history_stats(parse_samples, start=None, verbose=False, context=None):
     }, {
         "mean_all_ping_latency": wmean_all,
         "deciles_all_ping_latency[]": wdeciles_all,
-        "mean_full_ping_latency": statistics.fmean(rtt_full) if rtt_full else None,
+        "mean_full_ping_latency": mean_full,
         "deciles_full_ping_latency[]": deciles_full,
         "stdev_full_ping_latency": statistics.pstdev(rtt_full) if rtt_full else None,
     }, {

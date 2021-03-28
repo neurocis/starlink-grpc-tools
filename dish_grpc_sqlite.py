@@ -5,12 +5,27 @@ This script pulls the current status info and/or metrics computed from the
 history data and writes them to the specified sqlite database either once or
 in a periodic loop.
 
+Requested data will be written into the following tables:
+
+: status : Current status data
+: history : Bulk history data
+: ping_stats : Ping history statistics
+: usage : Usage history statistics
+
 Array data is currently written to the database as text strings of comma-
 separated values, which may not be the best method for some use cases. If you
 find yourself wishing they were handled better, please open a feature request
 at https://github.com/sparky8512/starlink-grpc-tools/issues explaining the use
 case and how you would rather see it. This only affects a few fields, since
 most of the useful data is not in arrays.
+
+Note that using this script to record the alert_detail group mode will tend to
+trip schema-related errors when new alert types are added to the dish
+software. The error message will include something like "table status has no
+column named alert_foo", where "foo" is the newly added alert type. To work
+around this rare occurrence, you can pass the -f option to force a schema
+update. Alternatively, instead of using the alert_detail mode, you can use the
+alerts bitmask in the status group.
 
 NOTE: The Starlink user terminal does not include time values with its
 history or status data, so this script uses current system time to compute
@@ -52,8 +67,8 @@ def parse_args():
     group.add_argument("-f",
                        "--force",
                        action="store_true",
-                       help="Override database schema downgrade protection; may result in "
-                       "discarded data")
+                       help="Force schema conversion, even if it results in downgrade; may "
+                       "result in discarded data")
     group.add_argument("-k",
                        "--skip-query",
                        action="store_true",
@@ -61,15 +76,17 @@ def parse_args():
 
     opts = dish_common.run_arg_parser(parser, need_id=True)
 
+    opts.skip_query |= opts.no_counter
+
     return opts
 
 
-def query_counter(opts, gstate):
+def query_counter(opts, gstate, column, table):
     now = time.time()
     cur = gstate.sql_conn.cursor()
     cur.execute(
-        'SELECT "time", "counter" FROM "history" WHERE "time"<? AND "id"=? '
-        'ORDER BY "time" DESC LIMIT 1', (now, gstate.dish_id))
+        'SELECT "time", "{0}" FROM "{1}" WHERE "time"<? AND "id"=? '
+        'ORDER BY "time" DESC LIMIT 1'.format(column, table), (now, gstate.dish_id))
     row = cur.fetchone()
     cur.close()
 
@@ -94,7 +111,6 @@ def loop_body(opts, gstate):
         tables[category][key] = ",".join(str(subv) if subv is not None else "" for subv in val)
 
     def cb_add_bulk(bulk, count, timestamp, counter):
-        nonlocal hist_cols
         if len(hist_cols) == 2:
             hist_cols.extend(bulk.keys())
             hist_cols.append("counter")
@@ -107,11 +123,16 @@ def loop_body(opts, gstate):
             hist_rows.append(row)
 
     now = int(time.time())
-    rc = dish_common.get_data(opts, gstate, cb_add_item, cb_add_sequence)
+    rc = dish_common.get_status_data(opts, gstate, cb_add_item, cb_add_sequence)
+
+    if opts.history_stats_mode and not rc:
+        if gstate.counter_stats is None and not opts.skip_query and opts.samples < 0:
+            _, gstate.counter_stats = query_counter(opts, gstate, "end_counter", "ping_stats")
+        rc = dish_common.get_history_stats(opts, gstate, cb_add_item, cb_add_sequence)
 
     if opts.bulk_mode and not rc:
-        if gstate.counter is None and opts.samples < 0:
-            gstate.timestamp, gstate.counter = query_counter(opts, gstate)
+        if gstate.counter is None and not opts.skip_query and opts.bulk_samples < 0:
+            gstate.timestamp, gstate.counter = query_counter(opts, gstate, "counter", "history")
         rc = dish_common.get_bulk_data(opts, gstate, cb_add_bulk)
 
     rows_written = 0
@@ -139,7 +160,7 @@ def loop_body(opts, gstate):
         gstate.sql_conn.commit()
     except sqlite3.OperationalError as e:
         # these are not necessarily fatal, but also not much can do about
-        logging.error("Unexpected error from database, discarding %s rows: %s", rows_written, e)
+        logging.error("Unexpected error from database, discarding data: %s", e)
         rc = 1
     else:
         if opts.verbose:
@@ -148,34 +169,39 @@ def loop_body(opts, gstate):
     return rc
 
 
-def ensure_schema(opts, conn):
+def ensure_schema(opts, conn, context):
     cur = conn.cursor()
     cur.execute("PRAGMA user_version")
     version = cur.fetchone()
-    if version and version[0] == SCHEMA_VERSION:
+    if version and version[0] == SCHEMA_VERSION and not opts.force:
         cur.close()
-        return
+        return 0
 
-    if not version or not version[0]:
-        if opts.verbose:
-            print("Initializing new database")
-        create_tables(conn, "")
-    elif version[0] > SCHEMA_VERSION and not opts.force:
-        logging.error("Cowardly refusing to downgrade from schema version %s", version[0])
-        raise Terminated
-    else:
-        print("Converting from schema version:", version[0])
-        convert_tables(conn)
+    try:
+        if not version or not version[0]:
+            if opts.verbose:
+                print("Initializing new database")
+            create_tables(conn, context, "")
+        elif version[0] > SCHEMA_VERSION and not opts.force:
+            logging.error("Cowardly refusing to downgrade from schema version %s", version[0])
+            return 1
+        else:
+            print("Converting from schema version:", version[0])
+            convert_tables(conn, context)
+        cur.execute("PRAGMA user_version={0}".format(SCHEMA_VERSION))
+        conn.commit()
+        return 0
+    except starlink_grpc.GrpcError as e:
+        dish_common.conn_error(opts, "Failure reflecting status fields: %s", str(e))
+        return 1
+    finally:
+        cur.close()
 
-    cur.execute("PRAGMA user_version={0}".format(SCHEMA_VERSION))
-    cur.close()
-    conn.commit()
 
-
-def create_tables(conn, suffix):
+def create_tables(conn, context, suffix):
     tables = {}
-    name_groups = starlink_grpc.status_field_names()
-    type_groups = starlink_grpc.status_field_types()
+    name_groups = starlink_grpc.status_field_names(context=context)
+    type_groups = starlink_grpc.status_field_types(context=context)
     tables["status"] = zip(name_groups, type_groups)
 
     name_groups = starlink_grpc.history_stats_field_names()
@@ -220,8 +246,8 @@ def create_tables(conn, suffix):
     return column_info
 
 
-def convert_tables(conn):
-    new_column_info = create_tables(conn, "_new")
+def convert_tables(conn, context):
+    new_column_info = create_tables(conn, context, "_new")
     conn.row_factory = sqlite3.Row
     old_cur = conn.cursor()
     new_cur = conn.cursor()
@@ -245,7 +271,7 @@ def main():
 
     logging.basicConfig(format="%(levelname)s: %(message)s")
 
-    gstate = dish_common.GlobalState()
+    gstate = dish_common.GlobalState(target=opts.target)
     gstate.points = []
     gstate.deferred_points = []
 
@@ -254,7 +280,9 @@ def main():
 
     rc = 0
     try:
-        ensure_schema(opts, gstate.sql_conn)
+        rc = ensure_schema(opts, gstate.sql_conn, gstate.context)
+        if rc:
+            sys.exit(rc)
         next_loop = time.monotonic()
         while True:
             rc = loop_body(opts, gstate)

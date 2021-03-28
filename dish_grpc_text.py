@@ -4,6 +4,11 @@
 This script pulls the current status info and/or metrics computed from the
 history data and prints them to stdout either once or in a periodic loop.
 By default, it will print the results in CSV format.
+
+Note that using this script to record the alert_detail group mode as CSV
+data is not recommended, because the number of alerts and their relative
+order in the output can change with the dish software. Instead of using
+the alert_detail mode, you can use the alerts bitmask in the status group.
 """
 
 from datetime import datetime
@@ -65,7 +70,7 @@ def parse_args():
 
     opts = dish_common.run_arg_parser(parser, no_stdout_errors=True)
 
-    if len(opts.mode) > 1 and "bulk_history" in opts.mode:
+    if (opts.history_stats_mode or opts.satus_mode) and opts.bulk_mode:
         parser.error("bulk_history cannot be combined with other modes for CSV output")
 
     return opts
@@ -85,13 +90,18 @@ def print_header(opts):
                 header.append(name)
 
     if opts.satus_mode:
-        status_names, obstruct_names, alert_names = starlink_grpc.status_field_names()
+        context = starlink_grpc.ChannelContext(target=opts.target)
+        try:
+            name_groups = starlink_grpc.status_field_names(context=context)
+        except starlink_grpc.GrpcError as e:
+            dish_common.conn_error(opts, "Failure reflecting status field names: %s", str(e))
+            return 1
         if "status" in opts.mode:
-            header_add(status_names)
+            header_add(name_groups[0])
         if "obstruction_detail" in opts.mode:
-            header_add(obstruct_names)
+            header_add(name_groups[1])
         if "alert_detail" in opts.mode:
-            header_add(alert_names)
+            header_add(name_groups[2])
 
     if opts.bulk_mode:
         general, bulk = starlink_grpc.history_bulk_field_names()
@@ -114,6 +124,7 @@ def print_header(opts):
             header_add(usage)
 
     print(",".join(header))
+    return 0
 
 
 def loop_body(opts, gstate):
@@ -142,8 +153,8 @@ def loop_body(opts, gstate):
     def cb_add_bulk(bulk, count, timestamp, counter):
         if opts.verbose:
             print("Time range (UTC):      {0} -> {1}".format(
-                datetime.fromtimestamp(timestamp).isoformat(),
-                datetime.fromtimestamp(timestamp + count).isoformat()))
+                datetime.utcfromtimestamp(timestamp).isoformat(),
+                datetime.utcfromtimestamp(timestamp + count).isoformat()))
             for key, val in bulk.items():
                 print("{0:22} {1}".format(key + ":", ", ".join(str(subval) for subval in val)))
             if opts.loop_interval > 0.0:
@@ -151,7 +162,7 @@ def loop_body(opts, gstate):
         else:
             for i in range(count):
                 timestamp += 1
-                fields = [datetime.fromtimestamp(timestamp).isoformat()]
+                fields = [datetime.utcfromtimestamp(timestamp).isoformat()]
                 fields.extend(["" if val[i] is None else str(val[i]) for val in bulk.values()])
                 print(",".join(fields))
 
@@ -180,10 +191,10 @@ def main():
     logging.basicConfig(format="%(levelname)s: %(message)s")
 
     if opts.print_header:
-        print_header(opts)
-        sys.exit(0)
+        rc = print_header(opts)
+        sys.exit(rc)
 
-    gstate = dish_common.GlobalState()
+    gstate = dish_common.GlobalState(target=opts.target)
 
     try:
         next_loop = time.monotonic()
